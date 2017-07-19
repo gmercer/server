@@ -810,8 +810,25 @@ void lex_end_stage1(LEX *lex)
   }
   else
   {
-    delete lex->sphead;
+    if (lex->sphead != lex->package_body)
+      delete lex->sphead;
     lex->sphead= NULL;
+  }
+
+  if (lex->package_body)
+  {
+    /*
+      Cleanup package_body only if we're cleaning up the top level LEX
+      corresponging to the "CREATE PACKAGE [BODY]" statement.
+      Otherwise, we're cleaning up a package routine sublex corresponding to a
+      package PROCEDURE/FUNCTION definition, e.g. in Package_body::cleanup().
+      The top-level LEX::package_body and the sub-LEX::package_body point to
+      the same Package_body instance, it should be left intact at this point.
+      It will be cleaned up later, during cleanup for the top-level LEX.
+    */
+    if (lex->package_body->m_top_level_lex == lex)
+      delete lex->package_body;
+    lex->package_body= NULL;
   }
 
   DBUG_VOID_RETURN;
@@ -840,6 +857,7 @@ Yacc_state::~Yacc_state()
     my_free(yacc_yyvs);
   }
 }
+
 
 static int find_keyword(Lex_input_stream *lip, uint len, bool function)
 {
@@ -2907,10 +2925,27 @@ void LEX::cleanup_lex_after_parse_error(THD *thd)
     Sic: we must nullify the member of the main lex, not the
     current one that will be thrown away
   */
-  if (thd->lex->sphead)
+  if (thd->lex->sphead &&
+      thd->lex->sphead != thd->lex->package_body)
   {
     thd->lex->sphead->restore_thd_mem_root(thd);
     delete thd->lex->sphead;
+    thd->lex->sphead= NULL;
+  }
+  if (thd->lex->package_body)
+  {
+    thd->lex->package_body->restore_thd_mem_root(thd);
+    /*
+      If a syntax error happened inside a package routine definition,
+      then thd->lex points to the routine sublex. We need to restore to
+      the top level LEX.
+      No needs to cleanup the current sub-lex: it's referenced from
+      package_body and will be cleaned during Package_body::cleanup().
+    */
+    LEX *top_level_lex= thd->lex->package_body->m_top_level_lex;
+    DBUG_ASSERT(top_level_lex);
+    DBUG_ASSERT(thd->lex->package_body == top_level_lex->package_body);
+    thd->lex= top_level_lex;
     thd->lex->sphead= NULL;
   }
 }
@@ -3000,6 +3035,7 @@ void Query_tables_list::destroy_query_tables_list()
 
 LEX::LEX()
   : explain(NULL),
+    package_body(0),
     result(0), arena_for_set_stmt(0), mem_root_for_set_stmt(0),
     option_type(OPT_DEFAULT), context_analysis_only(0), sphead(0),
     is_lex_started(0), limit_rows_examined_cnt(ULONGLONG_MAX)
@@ -5830,11 +5866,33 @@ sp_head *LEX::make_sp_head(THD *thd, sp_name *name,
     sp->reset_thd_mem_root(thd);
     sp->init(this);
     if (name)
+    {
       sp->init_sp_name(thd, name);
+      if (thd->lex->package_body)
+      {
+        sp->make_package_routine_name(thd,
+                                      thd->lex->package_body->m_name,
+                                      sp->m_name);
+        sp->make_qname(thd, &sp->m_qname);
+      }
+    }
     sphead= sp;
   }
   sp_chistics.init();
   return sp;
+}
+
+
+sp_head *LEX::make_sp_head_no_recursive(THD *thd, sp_name *name,
+                                        enum stored_procedure_type type)
+{
+  if (!sphead ||
+      sphead->m_type == TYPE_ENUM_PACKAGE_BODY ||
+      sphead->m_type == TYPE_ENUM_PACKAGE)
+    return make_sp_head(thd, name, type);
+  my_error(ER_SP_NO_RECURSIVE_CREATE, MYF(0),
+           stored_procedure_type_to_str(type));
+  return NULL;
 }
 
 
@@ -6647,6 +6705,18 @@ Item *LEX::create_item_ident_sp(THD *thd, LEX_CSTRING *name,
     if (!my_strcasecmp(system_charset_info, name->str, "SQLERRM"))
       return new (thd->mem_root) Item_func_sqlerrm(thd);
   }
+
+  if (package_body &&
+      (spv= package_body->get_parse_context()->find_variable(name, false)))
+  {
+    if (!parsing_options.allows_variable)
+    {
+      my_error(ER_VIEW_SELECT_VARIABLE, MYF(0));
+      return NULL;
+    }
+    return new (thd->mem_root) Item_func_get_user_var(thd, name);
+  }
+
   return create_item_ident_nosp(thd, name);
 }
 
@@ -7094,4 +7164,44 @@ bool LEX::add_create_view(THD *thd, DDL_options_st ddl,
                                       algorithm, suid)))
     return true;
   return create_or_alter_view_finalize(thd, table_ident);
+}
+
+
+Package_body *LEX::create_package_start(THD *thd,
+                                        enum_sql_command command,
+                                        stored_procedure_type type,
+                                        const LEX_CSTRING &name_arg,
+                                        DDL_options_st options)
+{
+  if (set_command_with_check(command, options))
+    return NULL;
+  Database_qualified_name tmp(thd->db_lex_cstring(), name_arg);
+  if (!(package_body= new Package_body(this, tmp, type)))
+    return NULL;
+  package_body->reset_thd_mem_root(thd);
+  package_body->init(this);
+  sphead= package_body;
+  return package_body;
+}
+
+
+
+bool LEX::create_package_finalize(THD *thd,
+                                  const LEX_CSTRING &name,
+                                  const LEX_CSTRING &name2,
+                                  const char *body_start,
+                                  const char *body_end)
+{
+  if (name2.str && strcmp(name2.str, name.str))
+  {
+    my_error(ER_END_IDENTIFIER_DOES_NOT_MATCH, MYF(0), name2.str, name.str);
+    return true;
+  }
+  package_body->m_body.length= body_end - body_start;
+  if (!(package_body->m_body.str= thd->strmake(body_start,
+                                               package_body->m_body.length)))
+    return true;
+  package_body->restore_thd_mem_root(thd);
+  sphead= NULL;
+  return false;
 }

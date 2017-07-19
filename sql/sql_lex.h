@@ -2648,6 +2648,8 @@ struct LEX: public Query_tables_list
   /* Query Plan Footprint of a currently running select  */
   Explain_query *explain;
 
+  Package_body *package_body;
+
   // type information
   CHARSET_INFO *charset;
 
@@ -3158,14 +3160,7 @@ public:
   sp_head *make_sp_head(THD *thd, sp_name *name,
                         enum stored_procedure_type type);
   sp_head *make_sp_head_no_recursive(THD *thd, sp_name *name,
-                                     enum stored_procedure_type type)
-  {
-    if (!sphead)
-      return make_sp_head(thd, name, type);
-    my_error(ER_SP_NO_RECURSIVE_CREATE, MYF(0),
-             stored_procedure_type_to_str(type));
-    return NULL;
-  }
+                                     enum stored_procedure_type type);
   sp_head *make_sp_head_no_recursive(THD *thd,
                                      DDL_options_st options, sp_name *name,
                                      enum stored_procedure_type type)
@@ -3174,6 +3169,16 @@ public:
       return NULL;
     return make_sp_head_no_recursive(thd, name, type);
   }
+  Package_body *create_package_start(THD *thd,
+                                     enum_sql_command command,
+                                     stored_procedure_type type,
+                                     const LEX_CSTRING &name,
+                                     DDL_options_st options);
+  bool create_package_finalize(THD *thd,
+                               const LEX_CSTRING &name,
+                               const LEX_CSTRING &name2,
+                               const char *body_start,
+                               const char *body_end);
   bool init_internal_variable(struct sys_var_with_base *variable,
                              const LEX_CSTRING *name);
   bool init_internal_variable(struct sys_var_with_base *variable,
@@ -3862,6 +3867,7 @@ public:
     /* Keep the parent SP stuff */
     sphead= oldlex->sphead;
     spcont= oldlex->spcont;
+    package_body= oldlex->package_body;
     /* Keep the parent trigger stuff too */
     trg_chistics= oldlex->trg_chistics;
     trg_table_fields.empty();
