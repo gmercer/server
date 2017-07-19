@@ -3506,7 +3506,10 @@ static void init_pcre()
 #ifndef EMBEDDED_LIBRARY
   pcre_stack_guard= check_enough_stack_size_slow;
   /* See http://pcre.org/original/doc/html/pcrestack.html */
-  my_pcre_frame_size= -pcre_exec(NULL, NULL, NULL, -999, -999, 0, NULL, 0) + 16;
+  my_pcre_frame_size= -pcre_exec(NULL, NULL, NULL, -999, -999, 0, NULL, 0);
+  // pcre can underestimate its stack usage. Use a safe value, as in the manual
+  set_if_bigger(my_pcre_frame_size, 500);
+  my_pcre_frame_size += 16; // Again, safety margin, see the manual
 #endif
 }
 
